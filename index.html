@@ -1,1 +1,545 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>🚀 Raketenstart – Fliege ins Weltall</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-user-select:none;user-select:none;touch-action:none;}
+  canvas{display:block;}
+  #hint{position:fixed;bottom:8px;left:50%;transform:translateX(-50%);
+    color:#9fe8c0;font-size:12px;opacity:.65;pointer-events:none;white-space:nowrap;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hint">LEERTASTE / ↑ = Schub &nbsp;·&nbsp; R = Neustart</div>
 
+<script>
+"use strict";
+
+/* ================= SETUP ================= */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = Math.floor(W * dpr);
+  canvas.height = Math.floor(H * dpr);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ================= KONSTANTEN ================= */
+const GRAVITY     = 300;     // Schwerkraft (Einheiten/s²)
+const THRUST      = 760;     // Schubkraft (Einheiten/s²)
+const FUEL_MAX    = 100;     // Tankgröße
+const FUEL_BURN   = 10;      // Verbrauch pro Sekunde
+const SPACE_Y     = 5000;    // ab hier = Weltraum
+const SAFE_LAND   = 175;     // max. Aufprallgeschwindigkeit (m/s)
+const ROCKET_W    = 26;
+const ROCKET_H    = 64;
+
+/* ================= HILFSFUNKTIONEN ================= */
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+const lerp  = (a,b,t)=> a+(b-a)*t;
+const mod   = (a,n)=> ((a%n)+n)%n;
+
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+/* ================= SPIELZUSTAND ================= */
+let rocket, state, particles, camBottom, time, lastImpact, spaceFlash;
+const keys = {};
+
+let stars = [], clouds = [];
+
+function initWorld(){
+  stars = [];
+  for(let i=0;i<230;i++){
+    stars.push({
+      x: Math.random(),
+      ny: Math.random(),
+      r: Math.random()*1.4 + 0.35,
+      tw: Math.random()*Math.PI*2
+    });
+  }
+  clouds = [];
+  for(let i=0;i<30;i++){
+    clouds.push({
+      x: (Math.random()-0.5)*1600,
+      y: 350 + Math.random()*3200,
+      s: 0.55 + Math.random()*1.15,
+      o: 0.25 + Math.random()*0.5
+    });
+  }
+}
+
+function reset(){
+  rocket = { y:0, v:0, fuel:FUEL_MAX, reachedSpace:false, thrusting:false };
+  particles = [];
+  state = 'ready';
+  camBottom = -120;
+  time = 0;
+  lastImpact = 0;
+  spaceFlash = 0;
+}
+
+/* ================= STEUERUNG ================= */
+function isThrustKey(k){
+  return k === ' ' || k === 'ArrowUp' || k === 'w' || k === 'W';
+}
+
+window.addEventListener('keydown', e=>{
+  if(isThrustKey(e.key) || e.key === 'r' || e.key === 'R') e.preventDefault();
+  keys[e.key] = true;
+
+  if(e.key === 'r' || e.key === 'R'){ reset(); return; }
+
+  if(state === 'ready' && isThrustKey(e.key)) state = 'flying';
+});
+window.addEventListener('keyup', e=>{ keys[e.key] = false; });
+
+canvas.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  if(state === 'crashed' || state === 'won'){ reset(); return; }
+  keys[' '] = true;
+  if(state === 'ready') state = 'flying';
+}, {passive:false});
+canvas.addEventListener('touchend', e=>{ e.preventDefault(); keys[' '] = false; }, {passive:false});
+
+/* ================= PARTIKEL ================= */
+function spawnExhaust(){
+  for(let i=0;i<2;i++){
+    const life = 0.45 + Math.random()*0.35;
+    particles.push({
+      wx: (Math.random()-0.5)*10,
+      wy: rocket.y - 2,
+      vx: (Math.random()-0.5)*70,
+      vy: -140 - Math.random()*160,
+      life: life,
+      maxLife: life,
+      r: 3 + Math.random()*4,
+      color: Math.random() < 0.45 ? '#ffd166' : '#ff7b00',
+      grav: 0
+    });
+  }
+}
+
+function explode(impact){
+  const n = Math.min(140, 45 + impact/8);
+  for(let i=0;i<n;i++){
+    const a  = Math.random()*Math.PI*2;
+    const sp = 80 + Math.random()*430;
+    const life = 0.6 + Math.random()*0.9;
+    particles.push({
+      wx: (Math.random()-0.5)*22,
+      wy: rocket.y + 20 + Math.random()*40,
+      vx: Math.cos(a)*sp,
+      vy: Math.sin(a)*sp,
+      life: life,
+      maxLife: life,
+      r: 2 + Math.random()*6,
+      color: ['#ffdd55','#ff8800','#ff3300','#9a9a9a'][Math.floor(Math.random()*4)],
+      grav: 220
+    });
+  }
+}
+
+/* ================= UPDATE ================= */
+function update(dt){
+  time += dt;
+  if(spaceFlash > 0) spaceFlash -= dt;
+
+  if(state === 'flying'){
+    rocket.thrusting = (keys[' '] || keys['ArrowUp'] || keys['w'] || keys['W']) && rocket.fuel > 0;
+
+    let acc = -GRAVITY;
+    if(rocket.thrusting){
+      acc += THRUST;
+      rocket.fuel = Math.max(0, rocket.fuel - FUEL_BURN * dt);
+      spawnExhaust();
+    }
+
+    rocket.v += acc * dt;
+    rocket.y += rocket.v * dt;
+
+    if(rocket.y >= SPACE_Y && !rocket.reachedSpace){
+      rocket.reachedSpace = true;
+      spaceFlash = 3;
+    }
+
+    /* Bodenkontakt */
+    if(rocket.y <= 0){
+      rocket.y = 0;
+      const impact = -rocket.v;
+      if(impact > SAFE_LAND){
+        lastImpact = Math.round(impact);
+        state = 'crashed';
+        rocket.thrusting = false;
+        explode(impact);
+      } else {
+        rocket.v = 0;
+        rocket.thrusting = false;
+        if(rocket.reachedSpace){
+          state = 'won';
+        } else {
+          state = 'ready';
+          rocket.fuel = FUEL_MAX;   // Betanken am Startplatz
+        }
+      }
+    }
+  } else {
+    rocket.thrusting = false;
+  }
+
+  /* Partikel */
+  for(let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    if(p.grav){
+      p.vy -= p.grav * dt;
+    } else {
+      p.vx -= p.vx * 2 * dt;
+      p.vy -= p.vy * 2 * dt;
+    }
+    p.wx += p.vx * dt;
+    p.wy += p.vy * dt;
+    p.life -= dt;
+    if(p.life <= 0) particles.splice(i,1);
+  }
+}
+
+/* ================= ZEICHNEN ================= */
+function toScreenY(worldY){
+  return H - (worldY - camBottom);
+}
+
+function drawSky(){
+  const alt = Math.max(0, rocket.y);
+  const t = clamp((alt - 200) / 3500, 0, 1);
+
+  const top = [lerp(45,0,t),  lerp(110,0,t),  lerp(200,8,t)];
+  const bot = [lerp(175,12,t),lerp(215,10,t), lerp(255,36,t)];
+
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, `rgb(${top[0]|0},${top[1]|0},${top[2]|0})`);
+  g.addColorStop(1, `rgb(${bot[0]|0},${bot[1]|0},${bot[2]|0})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  /* Sterne */
+  const starAlpha = clamp((alt - 700) / 2600, 0, 1);
+  if(starAlpha > 0.01){
+    ctx.save();
+    for(const s of stars){
+      const sy = mod(s.ny*H + camBottom*0.12, H);
+      const a  = starAlpha * (0.45 + 0.55*Math.sin(time*2.2 + s.tw));
+      ctx.globalAlpha = clamp(a, 0, 1);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(s.x*W, sy, s.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function drawClouds(){
+  const fade = 1 - clamp((rocket.y - 2600)/1800, 0, 1);
+  if(fade <= 0) return;
+  ctx.save();
+  for(const c of clouds){
+    const sy = toScreenY(c.y);
+    if(sy < -250 || sy > H+250) continue;
+    const sx = W/2 + c.x;
+    ctx.globalAlpha = c.o * fade;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.ellipse(sx,            sy,           62*c.s, 22*c.s, 0, 0, Math.PI*2);
+    ctx.ellipse(sx + 42*c.s,   sy + 7*c.s,   44*c.s, 16*c.s, 0, 0, Math.PI*2);
+    ctx.ellipse(sx - 42*c.s,   sy + 9*c.s,   40*c.s, 14*c.s, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawGround(){
+  const groundY = toScreenY(0);
+  if(groundY > H + 60) return;
+
+  const g = ctx.createLinearGradient(0, groundY, 0, H);
+  g.addColorStop(0,    '#4a8a34');
+  g.addColorStop(0.08, '#7a5230');
+  g.addColorStop(1,    '#33210f');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, groundY, W, H - groundY + 2);
+
+  /* Gras-Kante */
+  ctx.fillStyle = '#5fae3f';
+  ctx.fillRect(0, groundY, W, 5);
+
+  /* Startrampe */
+  ctx.fillStyle = '#6b7078';
+  ctx.fillRect(W/2 - 62, groundY - 10, 124, 10);
+  ctx.fillStyle = '#8b929b';
+  ctx.fillRect(W/2 - 62, groundY - 10, 124, 3);
+
+  /* kleine Markierungen */
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  for(let i=-58; i<58; i+=18){
+    ctx.fillRect(W/2 + i, groundY - 8, 8, 2);
+  }
+}
+
+function drawRocket(){
+  const bottomY = toScreenY(rocket.y);
+  const x = W/2;
+  const w = ROCKET_W, h = ROCKET_H;
+  const top = bottomY - h;
+
+  /* Flamme */
+  if(rocket.thrusting && rocket.fuel > 0){
+    const fl = 34 + Math.random()*34;
+    const fg = ctx.createLinearGradient(0, bottomY, 0, bottomY + fl);
+    fg.addColorStop(0,   'rgba(255,255,220,1)');
+    fg.addColorStop(0.35,'rgba(255,180,50,0.95)');
+    fg.addColorStop(1,   'rgba(255,60,0,0)');
+    ctx.fillStyle = fg;
+    ctx.beginPath();
+    ctx.moveTo(x - w*0.34, bottomY);
+    ctx.lineTo(x + w*0.34, bottomY);
+    ctx.lineTo(x, bottomY + fl);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  /* Flossen */
+  ctx.fillStyle = '#e63946';
+  ctx.beginPath();
+  ctx.moveTo(x - w/2, bottomY - 24);
+  ctx.lineTo(x - w/2 - 13, bottomY);
+  ctx.lineTo(x - w/2, bottomY);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(x + w/2, bottomY - 24);
+  ctx.lineTo(x + w/2 + 13, bottomY);
+  ctx.lineTo(x + w/2, bottomY);
+  ctx.closePath();
+  ctx.fill();
+
+  /* Körper */
+  const bg = ctx.createLinearGradient(x - w/2, 0, x + w/2, 0);
+  bg.addColorStop(0,   '#a8b2bd');
+  bg.addColorStop(0.32,'#ffffff');
+  bg.addColorStop(0.7, '#e2e8ef');
+  bg.addColorStop(1,   '#7d8794');
+  ctx.fillStyle = bg;
+  ctx.fillRect(x - w/2, top + 22, w, h - 22);
+
+  /* Nase */
+  ctx.fillStyle = '#e63946';
+  ctx.beginPath();
+  ctx.moveTo(x, top);
+  ctx.quadraticCurveTo(x + w/2, top + 8, x + w/2, top + 24);
+  ctx.lineTo(x - w/2, top + 24);
+  ctx.quadraticCurveTo(x - w/2, top + 8, x, top);
+  ctx.closePath();
+  ctx.fill();
+
+  /* Bullauge */
+  ctx.beginPath();
+  ctx.arc(x, top + 38, 7, 0, Math.PI*2);
+  ctx.fillStyle = '#1e3a8a';
+  ctx.fill();
+  ctx.strokeStyle = '#a9bccf';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x - 2.2, top + 35.8, 2.4, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fill();
+}
+
+function drawParticles(){
+  for(const p of particles){
+    const sy = toScreenY(p.wy);
+    const sx = W/2 + p.wx;
+    const a  = clamp(p.life / p.maxLife, 0, 1);
+    if(a <= 0) continue;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.r * (0.35 + 0.65*a), 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD(){
+  /* Panel */
+  ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  rr(14, 14, 246, 108, 12);
+  ctx.fill();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 17px system-ui,sans-serif';
+  ctx.fillText(`Höhe:  ${Math.max(0, Math.round(rocket.y))} m`, 28, 44);
+
+  const speed = Math.abs(rocket.v);
+  ctx.fillStyle = speed > SAFE_LAND ? '#ff8080' : '#bfe8ff';
+  ctx.fillText(`Tempo: ${Math.round(speed)} m/s`, 28, 70);
+
+  /* Treibstoffbalken */
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = '12px system-ui,sans-serif';
+  ctx.fillText('TREIBSTOFF', 28, 92);
+
+  const bx = 28, by = 98, bw = 218, bh = 13;
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fillRect(bx, by, bw, bh);
+
+  const f = rocket.fuel / FUEL_MAX;
+  ctx.fillStyle = f > 0.35 ? '#38d66b' : (f > 0.12 ? '#ffb02e' : '#ff3b30');
+  ctx.fillRect(bx, by, bw*f, bh);
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  /* Ziel oben rechts */
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 14px system-ui,sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(`Ziel: ${SPACE_Y} m  (Weltraum)`, W - 22, 36);
+  ctx.font = '13px system-ui,sans-serif';
+  ctx.fillStyle = rocket.reachedSpace ? '#7dffb0' : 'rgba(255,255,255,0.6)';
+  ctx.fillText(rocket.reachedSpace ? '✔ Weltraum erreicht – jetzt landen!' : '… noch nicht im Weltraum',
+               W - 22, 58);
+
+  /* Höhen-Fortschrittsbalken rechts */
+  const gx = W - 22, gy1 = 90, gy2 = H - 90;
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(gx, gy1); ctx.lineTo(gx, gy2); ctx.stroke();
+
+  const prog = clamp(rocket.y / SPACE_Y, 0, 1);
+  ctx.strokeStyle = prog >= 1 ? '#7dffb0' : '#5ac8ff';
+  ctx.beginPath();
+  ctx.moveTo(gx, gy2);
+  ctx.lineTo(gx, gy2 - (gy2 - gy1) * prog);
+  ctx.stroke();
+}
+
+function drawMessages(){
+  ctx.textAlign = 'center';
+
+  if(spaceFlash > 0){
+    const a = clamp(spaceFlash, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.font = 'bold 34px system-ui,sans-serif';
+    ctx.fillStyle = '#7dffb0';
+    ctx.fillText('🌌 WELTRAUM ERREICHT! 🌌', W/2, H*0.28);
+    ctx.globalAlpha = 1;
+  }
+
+  if(state === 'ready'){
+    const pulse = 0.6 + 0.4*Math.sin(time*4);
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 19px system-ui,sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('LEERTASTE / ↑ drücken zum Abheben', W/2, H - 155);
+    ctx.globalAlpha = 1;
+    ctx.font = '14px system-ui,sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(`Sicher landen unter ${SAFE_LAND} m/s`, W/2, H - 132);
+  }
+
+  if(state === 'crashed' || state === 'won'){
+    const pw = Math.min(560, W - 40);
+    const ph = 170;
+    const px = W/2 - pw/2;
+    const py = H/2 - ph/2;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    rr(px, py, pw, ph, 18);
+    ctx.fill();
+
+    ctx.strokeStyle = state === 'won' ? '#7dffb0' : '#ff5a5a';
+    ctx.lineWidth = 3;
+    rr(px, py, pw, ph, 18);
+    ctx.stroke();
+
+    ctx.font = 'bold 30px system-ui,sans-serif';
+    ctx.fillStyle = state === 'won' ? '#7dffb0' : '#ff6b6b';
+    ctx.fillText(state === 'won' ? '🏆 MISSION ERFÜLLT!' : '💥 CRASH!',
+                 W/2, py + 56);
+
+    ctx.font = '16px system-ui,sans-serif';
+    ctx.fillStyle = '#ffffff';
+    if(state === 'won'){
+      ctx.fillText('Du warst im Weltraum und bist sicher gelandet!', W/2, py + 92);
+    } else {
+      ctx.fillText(`Aufprallgeschwindigkeit: ${lastImpact} m/s`, W/2, py + 92);
+      ctx.fillText(`Erlaubt sind maximal ${SAFE_LAND} m/s`, W/2, py + 114);
+    }
+
+    const pulse = 0.55 + 0.45*Math.sin(time*5);
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 16px system-ui,sans-serif';
+    ctx.fillStyle = '#ffe066';
+    ctx.fillText('Drücke R für einen Neustart', W/2, py + 146);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function draw(){
+  camBottom = Math.max(-120, rocket.y - H*0.30);
+
+  drawSky();
+  drawClouds();
+  drawGround();
+  drawRocket();
+  drawParticles();
+  drawHUD();
+  drawMessages();
+}
+
+/* ================= LOOP ================= */
+let lastTime = 0;
+function loop(now){
+  if(!lastTime) lastTime = now;
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, 0.05);   // Stabilität
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(loop);
+}
+
+/* ================= START ================= */
+initWorld();
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
